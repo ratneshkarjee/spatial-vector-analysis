@@ -1,0 +1,70 @@
+# Vector data analysis using 'sf' package.
+
+/home/ratnesh/Ashoka_PhD/global-road-network
+
+setwd("/DATA2/ratnesh/Ashoka_PhD/global-road-network")
+
+
+
+
+library(sf)
+
+# Set the working directory
+setwd("/home/ratnesh/Ashoka_PhD/global-road-network")
+
+# Import the the vector/shapefile from the director
+rg1 <- st_read('/DATA2/ratnesh/Ashoka_PhD/global-road-network/GRIP4_Region1_vector_shp/GRIP4_region1.shp')
+rg2 <- st_read('/DATA2/ratnesh/Ashoka_PhD/global-road-network/GRIP4_Region2_vector_shp/GRIP4_region2.shp')
+rg3 <- st_read('/DATA2/ratnesh/Ashoka_PhD/global-road-network/GRIP4_Region3_vector_shp/GRIP4_region3.shp')
+rg4 <- st_read('/DATA2/ratnesh/Ashoka_PhD/global-road-network/GRIP4_Region4_vector_shp/GRIP4_region4.shp')
+rg5 <- st_read('/DATA2/ratnesh/Ashoka_PhD/global-road-network/GRIP4_Region5_vector_shp/GRIP4_region5.shp')
+rg6 <- st_read('/DATA2/ratnesh/Ashoka_PhD/global-road-network/GRIP4_Region6_vector_shp/GRIP4_region6.shp')
+rg7 <- st_read('/DATA2/ratnesh/Ashoka_PhD/global-road-network/GRIP4_Region7_vector_shp/GRIP4_region7.shp')
+
+
+# List all shapefiles in the directory
+shapefiles <- list.files(pattern = "\\.shp$")
+
+# Read the shapefiles
+roads_list <- lapply(shapefiles, st_read)
+# Check the column names of each shapefile
+lapply(roads_list, colnames)
+
+# Remove the OBJECTID column from the first shapefile
+roads_list[[3]] <- roads_list[[3]][, !(colnames(roads_list[[3]]) == "OBJECTID")]
+
+
+# Combine the shapefiles
+combined_roads <- do.call(rbind, roads_list)
+
+# Optionally, perform a union to dissolve boundaries
+merged_roads <- st_union(combined_roads)
+st_is_valid(merged_roads)
+merged_roads <- st_make_valid(merged_roads)
+
+> merged_roads_simplified <- st_simplify(merged_roads, dTolerance = 100)
+f coordinates
+num_coords <- nrow(st_coordinates(merged_roads_simplified))
+print(num_coords)
+
+# Print a summary of the data
+summary(merged_roads_simplified)
+>
+> # Check the number of coordinates
+> num_coords <- nrow(st_coordinates(merged_roads_simplified))
+> print(num_coords)
+[1] 82617401
+>
+> # Print a summary of the data
+> summary(merged_roads_simplified)
+MULTILINESTRING       epsg:4326   +proj=long...
+              1               0               0
+
+
+
+
+
+# Save the result to a new shapefile
+st_write(merged_roads_simplified,"/DATA2/ratnesh/Ashoka_PhD/global-road-network/merged-global-road-network.shp")
+# Write the result to a new shapefile
+ 
