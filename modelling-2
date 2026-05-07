@@ -1,0 +1,1374 @@
+################################################################################
+# COMPLETE SDM MODEL FITTING & PROJECTION WORKFLOW - CORRECTED VERSION
+# FIXES: Removed assignInNamespace hack, fixed temp file leakage, 
+#        proper parallel backend management
+# ============================================================================
+
+# ============================================================================
+# SECTION 0: LOAD PACKAGES
+# ============================================================================
+
+packages <- c("data.table", "dplyr", "tidyr", "terra", "flexsdm",
+              "ggplot2", "readr", "progress", "tibble", "tidyterra", "here")
+
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  } else {
+    library(pkg, character.only = TRUE)
+  }
+}
+
+msg("✓ All libraries loaded successfully\n")
+msg("✓ R temp directory:", tempdir())
+msg("✓ Terra temp directory:", terra_temp_dir)
+msg("")
+
+
+# ============================================================================
+# SECTION 1: SET WORKING DIRECTORY & TEMP PATHS (SIMPLIFIED - NO HACKS)
+# ============================================================================
+
+# Set working directory FIRST
+setwd("/DATA3/Ratnesh/sdm_new/zz-flexsdm/")
+base_dir <- getwd()
+
+# Create a dedicated temp directory (persist throughout script - DO NOT DELETE)
+custom_temp <- file.path(base_dir, "R_temp_files_SDM")
+if(!dir.exists(custom_temp)) {
+  dir.create(custom_temp, recursive = TRUE, showWarnings = FALSE)
+}
+
+# Set environment variables for temp files (DO NOT override tempdir())
+Sys.setenv(TMPDIR = custom_temp)
+Sys.setenv(TEMP = custom_temp)
+Sys.setenv(TMP = custom_temp)
+
+cat("R temp directory:", tempdir(), "\n")
+cat("Custom temp directory:", custom_temp, "\n\n")
+
+# ============================================================================
+# SECTION 1b: USER SETTINGS & CONFIGURATION PARAMETERS
+# ============================================================================
+
+# Pipeline control
+sdm_mode <- "both"   # Options: "without", "with", "both"
+
+# Species selection
+sp_select <- c(1, 4)    # "ALL" for all species, or c(1,4) for indices
+
+# Performance thresholds
+auc_thr <- 0.7
+
+# Parallel processing
+n_cores <- 10
+n_chunk <- 10
+
+# Uncertainty settings
+u_itr <- 10
+n_sim <- 10
+
+# PDP settings
+pdp_res <- 250
+set_dpi <- 500
+
+# Ensemble methods
+ens_method <- c("meanw", "median")
+
+# ============================================================================
+# TUNING GRIDS
+# ============================================================================
+
+grid_gbm <- expand.grid(
+  n.trees = seq(250, 1000, 250),
+  shrinkage = seq(0.01, 0.1, 0.02),
+  n.minobsinnode = seq(1, 10, 2)
+)
+
+grid_max <- expand.grid(
+  regmult = seq(0.5, 4, 0.5),
+  classes = c("l", "lq", "lqp", "lqph", "lqpht", "lqphth", "lqh", "lqhp", "lqhpt")
+)
+
+grid_net <- expand.grid(
+  size = 2:10,
+  decay = c(0.001, 0.01, 0.1, 0.5, 1, 2, 3, 4, 5)
+)
+
+grid_raf <- expand.grid(
+  mtry = 1:10,
+  ntree = c(400, 600, 800, 1000)
+)
+
+grid_svm <- expand.grid(
+  C = seq(2, 80, 5),
+  sigma = seq(0.001, 0.3, 0.01)
+)
+
+# ============================================================================
+# SECTION 2: CLEANUP FUNCTION - CORRECTED (NO DANGEROUS OPERATIONS)
+# ============================================================================
+
+cleanup_after_species <- function() {
+  # Only clean terra's internal temp files
+  # DO NOT delete the main temp directory
+  # DO NOT close all connections
+  tryCatch({
+    terra::tmpFiles(remove = TRUE, old = TRUE)
+  }, error = function(e) {})
+  
+  # Single garbage collection (not multiple)
+  gc(verbose = FALSE)
+  
+  # Small delay for OS to release handles
+  Sys.sleep(0.1)
+}
+
+# ============================================================================
+# SECTION 3: CONFIGURE GDAL AND TERRA OPTIONS (ONCE - PERSISTENT)
+# ============================================================================
+
+options("rgdal_show_exportToProj4_warnings" = "none")
+terra::setGDALconfig("GDAL_PAM_ENABLED", "FALSE")
+terra::setGDALconfig("GDAL_MAX_DATASET_POOL_SIZE", "45")
+terra::setGDALconfig("GDAL_CACHEMAX", "200")
+
+# Create terra temp directory (persistent - DO NOT recreate each species)
+terra_temp_dir <- file.path(custom_temp, "terra_temp")
+if(!dir.exists(terra_temp_dir)) {
+  dir.create(terra_temp_dir, recursive = TRUE, showWarnings = FALSE)
+}
+
+# Set terra options ONCE
+terra::terraOptions(memfrac = 0.4, tempdir = terra_temp_dir, todisk = TRUE)
+
+# Increase file descriptor limit on Linux
+if(Sys.info()["sysname"] == "Linux") {
+  tryCatch({
+    system("ulimit -n 65536", ignore.stdout = TRUE, ignore.stderr = TRUE)
+  }, error = function(e) invisible())
+}
+
+# ============================================================================
+# REGISTER PARALLEL BACKEND ONCE (DO NOT call inside loops)
+# ============================================================================
+
+msg <- function(...) {
+  txt <- paste(..., sep = " ")
+  cat(txt, "\n")
+}
+
+if(require(doParallel, quietly = TRUE)) {
+  registerDoParallel(cores = n_cores)
+  msg("✓ Parallel backend registered with", n_cores, "cores")
+} else {
+  msg("Warning: doParallel not available, running sequentially")
+}
+
+# ============================================================================
+# SECTION 4: MESSAGE HELPERS
+# ============================================================================
+
+crt_hed <- function(sp, i, total) {
+  header_text <- paste0("SPECIES: ", sp, " [", i, "/", total, "]")
+  header_width <- nchar(header_text)
+  line <- strrep("=", header_width)
+  list(line = line, text = header_text)
+}
+
+prt_hed <- function(header_obj) {
+  msg(header_obj$line)
+  msg(header_obj$text)
+  msg(header_obj$line)
+}
+
+prt_sec <- function(title) {
+  title_clean <- gsub("[^a-zA-Z0-9 _-]", "", title)
+  title_len <- nchar(title_clean, type = "width")
+  line <- paste(rep("=", title_len), collapse = "")
+  msg("")
+  msg(line)
+  msg(title_clean)
+  msg(line)
+}
+
+prt_sub <- function(title) {
+  title_clean <- gsub("[^a-zA-Z0-9 _-]", "", title)
+  title_len <- nchar(title_clean, type = "width")
+  line <- paste(rep("-", title_len), collapse = "")
+  msg("")
+  msg(line)
+  msg(title_clean)
+  msg(line)
+}
+
+
+
+# ============================================================================
+# SECTION 5: PATH CONFIGURATION
+# ============================================================================
+
+without_md_pred_dir <- file.path(base_dir, "02_Outputs", "04_Predictors_by_sp", "01_Without_MD")
+without_md_occ_dir <- file.path(base_dir, "02_Outputs", "02_Filtered_occ", "01_Without_MD")
+
+with_md_pred_dir <- file.path(base_dir, "02_Outputs", "04_Predictors_by_sp", "02_With_MD")
+with_md_occ_dir <- file.path(base_dir, "02_Outputs", "02_Filtered_occ", "02_With_MD")
+
+base_sdm <- file.path(base_dir, "02_Outputs", "07_SDM_outputs")
+
+paleo_names <- c("biolig", "biolgm", "biomdh")
+gcm <- c("HedGEM3", "CMCC-ESM2")
+ssp <- c("ssp126", "ssp585")
+period <- c("2041-2060", "2081-2100")
+
+future_names <- c()
+for(g in gcm) {
+  for(p in period) {
+    for(s in ssp) {
+      future_names <- c(future_names, paste0(g, "-", p, "-", s))
+    }
+  }
+}
+
+msg("Base directory:", base_dir)
+msg("Output directory:", base_sdm)
+msg("")
+
+# ============================================================================
+# SECTION 6: CREATE OUTPUT DIRECTORIES
+# ============================================================================
+
+prt_sec("CREATING OUTPUT DIRECTORIES")
+
+if(sdm_mode == "without") {
+  pipelines <- "01_Without_MD"
+} else if(sdm_mode == "with") {
+  pipelines <- "02_With_MD"
+} else if(sdm_mode == "both") {
+  pipelines <- c("01_Without_MD", "02_With_MD")
+} else {
+  stop("ERROR: sdm_mode must be 'without', 'with', or 'both'")
+}
+
+msg("Selected pipelines:", paste(pipelines, collapse=", "))
+msg("")
+
+for(pipeline in pipelines) {
+  
+  msg("Creating directories for:", pipeline)
+  
+  pipeline_dir <- file.path(base_sdm, pipeline)
+  
+  dir.create(file.path(pipeline_dir, "01_Model_fitted"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(pipeline_dir, "02_Model_perform"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(pipeline_dir, "03_PDP_Plot"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(pipeline_dir, "04_Hyper_plot"), recursive = TRUE, showWarnings = FALSE)
+  
+  unc_dir <- file.path(pipeline_dir, "05_Uncertainty")
+  dir.create(file.path(unc_dir, "01_Plots"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(unc_dir, "02_Summary"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(unc_dir, "03_Raster"), recursive = TRUE, showWarnings = FALSE)
+  
+  alg_dir <- file.path(pipeline_dir, "06_Algorithms")
+  dir.create(file.path(alg_dir, "01_Current"), recursive = TRUE, showWarnings = FALSE)
+  
+  paleo_alg_dir <- file.path(alg_dir, "02_Projection")
+  for(p in paleo_names) {
+    dir.create(file.path(paleo_alg_dir, p), recursive = TRUE, showWarnings = FALSE)
+  }
+  
+  future_alg_dir <- file.path(alg_dir, "03_Projection")
+  for(f in future_names) {
+    dir.create(file.path(future_alg_dir, f), recursive = TRUE, showWarnings = FALSE)
+  }
+  
+  ens_dir <- file.path(pipeline_dir, "07_Ensemble")
+  dir.create(file.path(ens_dir, "01_Current"), recursive = TRUE, showWarnings = FALSE)
+  
+  for(method in ens_method) {
+    dir.create(file.path(ens_dir, "01_Current", method, "01_con"), recursive = TRUE, showWarnings = FALSE)
+    dir.create(file.path(ens_dir, "01_Current", method, "02_bin"), recursive = TRUE, showWarnings = FALSE)
+  }
+  
+  paleo_ens_dir <- file.path(ens_dir, "02_Projection")
+  for(p in paleo_names) {
+    for(method in ens_method) {
+      dir.create(file.path(paleo_ens_dir, p, method, "01_con"), recursive = TRUE, showWarnings = FALSE)
+      dir.create(file.path(paleo_ens_dir, p, method, "02_bin"), recursive = TRUE, showWarnings = FALSE)
+    }
+  }
+  
+  future_ens_dir <- file.path(ens_dir, "03_Projection")
+  for(f in future_names) {
+    for(method in ens_method) {
+      dir.create(file.path(future_ens_dir, f, method, "01_con"), recursive = TRUE, showWarnings = FALSE)
+      dir.create(file.path(future_ens_dir, f, method, "02_bin"), recursive = TRUE, showWarnings = FALSE)
+    }
+  }
+}
+
+msg("All directories created")
+msg("")
+
+# ============================================================================
+# SECTION 7: MAIN SDM PIPELINE
+# ============================================================================
+
+for(pipeline in pipelines) {
+  
+  msg("\n")
+  prt_sub(paste("STARTING PIPELINE:", pipeline))
+  msg("")
+  
+  if(pipeline == "01_Without_MD") {
+    pred_dir <- without_md_pred_dir
+    occ_dir <- without_md_occ_dir
+    msg("Using: Without MD predictors")
+  } else if(pipeline == "02_With_MD") {
+    pred_dir <- with_md_pred_dir
+    occ_dir <- with_md_occ_dir
+    msg("Using: With MD predictors")
+  } else {
+    msg("ERROR: Unknown pipeline - skipping")
+    next
+  }
+  
+  out_pipeline_dir <- file.path(base_sdm, pipeline)
+  
+  perf_dir <- file.path(out_pipeline_dir, "02_Model_perform")
+  mod_out_dir <- file.path(out_pipeline_dir, "01_Model_fitted")
+  hypplot_cur <- file.path(out_pipeline_dir, "04_Hyper_plot")
+  pdp_plots_dir <- file.path(out_pipeline_dir, "03_PDP_Plot")
+  uncertainty_dir <- file.path(out_pipeline_dir, "05_Uncertainty")
+  
+  occ_file <- file.path(occ_dir, "1_occ_presabs_partitioned.gz")
+  bkg_file <- file.path(occ_dir, "1_occ_bkgroud_partitioned.gz")
+  
+  if(!file.exists(occ_file)) {
+    msg("ERROR: Missing file:", occ_file)
+    msg("Skipping pipeline:", pipeline)
+    next
+  }
+  
+  if(!file.exists(bkg_file)) {
+    msg("ERROR: Missing file:", bkg_file)
+    msg("Skipping pipeline:", pipeline)
+    next
+  }
+  
+  occ <- data.table::fread(occ_file) %>% tibble::as_tibble()
+  bkg <- data.table::fread(bkg_file) %>% tibble::as_tibble()
+  
+  if (!(".part" %in% names(occ))) {
+    set.seed(42)
+    n <- max(1, length(unique(na.omit(occ$.part))))
+    occ$.part <- sample(rep(seq_len(n), length.out = nrow(occ)))
+  }
+  
+  pred_current_dir <- file.path(pred_dir, "01_Current")
+  if(!dir.exists(pred_current_dir)) {
+    msg("ERROR: Missing directory:", pred_current_dir)
+    msg("Skipping pipeline:", pipeline)
+    next
+  }
+  
+  pred_files <- list.files(pred_current_dir, pattern = "\\.tif$", full.names = TRUE)
+  
+  if(length(pred_files) == 0) {
+    msg("ERROR: No .tif files found in:", pred_current_dir)
+    msg("Skipping pipeline:", pipeline)
+    next
+  }
+  
+  sp_names <- gsub("\\.tif$", "", basename(pred_files))
+  sp_final <- intersect(unique(occ$species), sp_names)
+  
+  if(sp_select[1] == "ALL") {
+    sp_ready <- sp_final
+  } else {
+    sp_ready <- sp_final[sp_select]
+  }
+  
+  msg("Pipeline:", sub("^\\d+_", "", pipeline))
+  msg("Species available:", length(sp_final))
+  msg("Species to process:", length(sp_ready))
+  msg("")
+  
+  if(length(sp_ready) == 0) {
+    msg("WARNING: No species to process for pipeline:", pipeline)
+    next
+  }
+  
+  pb <- progress::progress_bar$new(
+    total = length(sp_ready),
+    format = "[:bar] :current/:total (:percent) | :elapsed | :eta",
+    width = 60
+  )
+  
+  # ======================================
+  # SPECIES LOOP - CORRECTED (NO DANGEROUS OPERATIONS)
+  # ======================================
+  for (i in seq_along(sp_ready)) {
+    
+    # REMOVED: cleanup_after_species() and prepare_parallel() calls
+    # REMOVED: species_temp_dir creation
+    # REMOVED: terra::terraOptions(tempdir = ...) reassignment
+    
+    sp <- sp_ready[i]
+    sp_disp <- gsub("_", " ", sp)
+    
+    set.seed(123 + i)
+    
+    header <- crt_hed(sp, i, length(sp_ready))
+    prt_hed(header)
+    
+    tryCatch({
+      
+      cur_env_file <- file.path(pred_current_dir, paste0(sp, ".tif"))
+      if (!file.exists(cur_env_file)) {
+        msg("WARNING: Missing environmental file for:", sp)
+        pb$tick()
+        next
+      }
+      
+      env_r <- terra::rast(cur_env_file)
+      var_names <- names(env_r)
+      n_pred <- length(var_names)
+      
+      pa_pr <- dplyr::filter(occ, species == sp)
+      pa_bg <- dplyr::filter(bkg, species == sp)
+      
+      if (nrow(pa_pr) == 0) {
+        msg("WARNING: No presence records for:", sp)
+        pb$tick()
+        next
+      }
+      
+      part_cols <- grep("^\\.part", names(pa_pr), value = TRUE)
+      pa <- dplyr::bind_rows(pa_pr, pa_bg) %>%
+        dplyr::select(dplyr::any_of(c("x", "y", "pr_ab", "species", part_cols)))
+      b <- dplyr::select(pa_bg, dplyr::any_of(c("x", "y", "pr_ab", "species", part_cols)))
+      
+      pa <- tryCatch(flexsdm::sdm_extract(pa, x = "x", y = "y", env_layer = env_r), error = function(e) NULL)
+      b <- tryCatch(flexsdm::sdm_extract(b, x = "x", y = "y", env_layer = env_r), error = function(e) NULL)
+      
+      if (is.null(pa) || is.null(b)) {
+        pb$tick()
+        next
+      }
+      
+      pa <- tidyr::drop_na(pa)
+      b <- tidyr::drop_na(b)
+      
+      n_pres <- nrow(dplyr::filter(pa, pr_ab == 1))
+      
+      if (n_pres < 5) {
+        msg("WARNING: Too few presences for:", sp, "-", n_pres)
+        pb$tick()
+        next
+      }
+      
+      msg("Predictors:", length(var_names))
+      msg("Training records =", n_pres)
+      
+      # GLM
+      msg("GLM Fitting...")
+      if (n_pres >= 100) {
+        m_glm <- tryCatch(
+          flexsdm::fit_glm(data = pa, response = "pr_ab", predictors = var_names,
+                           partition = ".part", thr = "max_sens_spec", poly = 2),
+          error = function(e) NULL
+        )
+      } else { m_glm <- NULL }
+      
+      # GAM
+      msg("GAM Fitting...")
+      if (n_pres >= 50) {
+        n_training <- tryCatch(flexsdm:::n_training(data = pa, partition = ".part"), error = function(e) min(n_pres, 50))
+        candidate_k <- 20
+        while (any(n_training < (candidate_k * 4)) && candidate_k > 3) candidate_k <- candidate_k - 1
+        candidate_k <- max(3, candidate_k)
+        m_gam <- tryCatch(
+          flexsdm::fit_gam(data = pa, response = "pr_ab", predictors = var_names,
+                           partition = ".part", thr = "max_sens_spec", k = candidate_k),
+          error = function(e) NULL
+        )
+      } else { m_gam <- NULL }
+      
+      # GAU
+      msg("GAU Fitting...")
+      if (n_pres >= 15) {
+        m_gau <- tryCatch(
+          flexsdm::fit_gau(data = pa, response = "pr_ab", predictors = var_names,
+                           partition = ".part", background = b, thr = "max_sens_spec"),
+          error = function(e) NULL
+        )
+      } else { m_gau <- NULL }
+      
+      # GBM - REMOVED prepare_parallel() and cleanup calls
+      msg("GBM Fitting...")
+      set.seed(123)
+      m_gbm <- tryCatch(
+        flexsdm::tune_gbm(data = pa, response = "pr_ab", predictors = var_names,
+                          partition = ".part", grid = grid_gbm, thr = "max_sens_spec", 
+                          metric = "TSS", n_cores = n_cores),
+        error = function(e) NULL
+      )
+      
+      # MAX - REMOVED prepare_parallel() and cleanup calls
+      msg("MAX Fitting...")
+      set.seed(123)
+      m_max <- tryCatch(
+        flexsdm::tune_max(data = pa, response = "pr_ab", predictors = var_names,
+                          partition = ".part", background = b, grid = grid_max,
+                          thr = "max_sens_spec", metric = "TSS", n_cores = n_cores),
+        error = function(e) NULL
+      )
+      
+      # NET - REMOVED prepare_parallel() and cleanup calls
+      msg("NET Fitting...")
+      set.seed(123)
+      grid_net_dyn <- grid_net[grid_net$size <= min(n_pred, 10), ]
+      m_net <- tryCatch(
+        flexsdm::tune_net(data = pa, response = "pr_ab", predictors = var_names,
+                          partition = ".part", grid = grid_net_dyn, thr = "max_sens_spec", 
+                          metric = "TSS", n_cores = n_cores),
+        error = function(e) NULL
+      )
+      
+      # RAF - REMOVED prepare_parallel() and cleanup calls
+      msg("RAF Fitting...")
+      set.seed(123)
+      grid_raf_dyn <- grid_raf[grid_raf$mtry <= min(n_pred, 10), ]
+      m_raf <- tryCatch(
+        flexsdm::tune_raf(data = pa, response = "pr_ab", predictors = var_names,
+                          partition = ".part", grid = grid_raf_dyn, thr = "max_sens_spec", 
+                          metric = "TSS", n_cores = n_cores),
+        error = function(e) NULL
+      )
+      
+      # SVM - REMOVED prepare_parallel() and cleanup calls
+      msg("SVM Fitting...")
+      set.seed(123)
+      m_svm <- tryCatch(
+        flexsdm::tune_svm(data = pa, response = "pr_ab", predictors = var_names,
+                          partition = ".part", grid = grid_svm, thr = "max_sens_spec", 
+                          metric = "TSS", n_cores = n_cores),
+        error = function(e) NULL
+      )
+      
+      model_list_all <- list(glm = m_glm, gam = m_gam, gau = m_gau, gbm = m_gbm,
+                             max = m_max, net = m_net, raf = m_raf, svm = m_svm)
+      model_list_nonnull <- model_list_all[!vapply(model_list_all, is.null, logical(1))]
+      msg()
+      msg("Models fitted:", length(model_list_nonnull), "of 8")
+      
+      # Fix missing thresholds
+      for(alg in names(model_list_nonnull)) {
+        if(is.null(model_list_nonnull[[alg]]$threshold) || is.na(model_list_nonnull[[alg]]$threshold)) {
+          perf <- tryCatch(flexsdm::sdm_summarize(list(model_list_nonnull[[alg]])), error = function(e) NULL)
+          if(!is.null(perf) && !is.na(perf$thr_value[1])) {
+            model_list_nonnull[[alg]]$threshold <- perf$thr_value[1]
+          }
+        }
+      }
+      
+      # Performance evaluation
+      perf_summary <- NULL
+      if (length(model_list_nonnull) > 0) {
+        perf_summary <- tryCatch(suppressWarnings(flexsdm::sdm_summarize(model_list_nonnull)), error = function(e) NULL)
+        if (!is.null(perf_summary)) {
+          perf_file <- file.path(perf_dir, paste0(sp, "_performance.txt"))
+          if(!dir.exists(perf_dir)) dir.create(perf_dir, recursive = TRUE, showWarnings = FALSE)
+          readr::write_tsv(perf_summary, perf_file)
+          msg("Performance saved")
+        }
+      }
+      
+      # Variable importance
+      if (length(var_names) > 0 && length(model_list_nonnull) > 0) {
+        pred_sds <- sapply(pa[, intersect(var_names, names(pa)), drop = FALSE],
+                           function(x) if (is.numeric(x)) stats::sd(x, na.rm = TRUE) else NA_real_)
+        good_preds <- names(pred_sds)[!is.na(pred_sds) & pred_sds > 0]
+        
+        if (length(good_preds) > 0) {
+          varimp_out <- list()
+          for (alg in names(model_list_nonnull)) {
+            v_res <- tryCatch(
+              flexsdm::sdm_varimp(models = list(model_list_nonnull[[alg]]), data = pa,
+                                  response = "pr_ab", predictors = good_preds,
+                                  n_sim = n_sim, n_cores = n_cores, thr = "max_sens_spec", clamp = TRUE),
+              error = function(e) NULL
+            )
+            if (!is.null(v_res)) {
+              vdf <- if (is.data.frame(v_res)) v_res else if (is.list(v_res)) as.data.frame(v_res) else NULL
+              if (!is.null(vdf)) {
+                if (!("variable" %in% names(vdf))) vdf <- tibble::rownames_to_column(vdf, var = "variable")
+                num_cols <- names(vdf)[sapply(vdf, is.numeric) & names(vdf) != "variable"]
+                if (length(num_cols) > 0) {
+                  varimp_out[[alg]] <- tibble::tibble(
+                    variable = as.character(vdf$variable),
+                    importance_mean = as.numeric(rowMeans(vdf[, num_cols, drop = FALSE], na.rm = TRUE)),
+                    importance_median = as.numeric(apply(vdf[, num_cols, drop = FALSE], 1, median, na.rm = TRUE)),
+                    importance_sd = as.numeric(apply(vdf[, num_cols, drop = FALSE], 1, sd, na.rm = TRUE)),
+                    model = alg
+                  )
+                }
+              }
+            }
+            gc()
+          }
+          if (length(varimp_out) > 0) {
+            varimp_file <- file.path(perf_dir, paste0(sp, "_varimp.txt"))
+            readr::write_delim(dplyr::bind_rows(varimp_out), varimp_file, delim = "\t")
+          }
+        }
+      }
+      
+      # ========== UNCERTAINTY ANALYSIS ==========
+      successful_models <- model_list_nonnull[!sapply(model_list_nonnull, is.null)]
+      
+      if(length(successful_models) >= 2) {
+        msg("Running uncertainty analysis...")
+        uncertainty_rasters <- list()
+        
+        for(alg_name in names(successful_models)) {
+          msg("  Processing", alg_name, "...")
+          unc_result <- tryCatch({
+            flexsdm::sdm_uncertainty(
+              models = successful_models[[alg_name]],
+              training_data = pa,
+              response = "pr_ab",
+              projection_data = env_r,
+              iteration = u_itr,
+              n_cores = n_cores,
+              clamp = TRUE,
+              pred_type = "cloglog"
+            )
+          }, error = function(e) {
+            msg("    Error:", e$message)
+            return(NULL)
+          })
+          
+          if(!is.null(unc_result)) {
+            uncertainty_rasters[[alg_name]] <- unc_result
+            msg("    Completed")
+          }
+          gc()
+        }
+        
+        if(length(uncertainty_rasters) >= 2) {
+          unc_stack <- terra::rast(uncertainty_rasters)
+          
+          mean_unc <- terra::app(unc_stack, fun = mean, na.rm = TRUE)
+          median_unc <- terra::app(unc_stack, fun = median, na.rm = TRUE)
+          
+          terra::writeRaster(mean_unc, file.path(uncertainty_dir, "03_Raster", paste0(sp, "_mean_uncertainty.tif")), 
+                             overwrite = TRUE, wopt = list(gdal = c("COMPRESS=LZW")))
+          terra::writeRaster(median_unc, file.path(uncertainty_dir, "03_Raster", paste0(sp, "_median_uncertainty.tif")), 
+                             overwrite = TRUE, wopt = list(gdal = c("COMPRESS=LZW")))
+          
+          results <- data.frame(Model = character(), Uncertainty_Mean = numeric(), 
+                                stringsAsFactors = FALSE)
+          for(nm in names(uncertainty_rasters)) {
+            vals <- terra::values(uncertainty_rasters[[nm]], na.rm = TRUE)
+            results <- rbind(results, data.frame(Model = nm, 
+                                                 Uncertainty_Mean = mean(vals, na.rm = TRUE)))
+          }
+          write.csv(results, file.path(uncertainty_dir, "02_Summary", paste0(sp, "_individual_uncertainty.csv")), row.names = FALSE)
+          
+          names(mean_unc) <- "uncertainty"
+          p1 <- ggplot() + tidyterra::geom_spatraster(data = mean_unc) +
+            scale_fill_viridis_c(name = "Uncertainty", direction = 1, option = "inferno", na.value = "transparent") +
+            theme_bw() + labs(title = bquote(italic(.(sp_disp)) ~ "- Mean Uncertainty")) +
+            theme(plot.title = element_text(hjust = 0.5))
+          ggsave(file.path(uncertainty_dir, "01_Plots", paste0(sp, "_mean_uncertainty_map.png")), p1, dpi = set_dpi, width = 10, height = 8)
+          
+          names(median_unc) <- "uncertainty"
+          p2 <- ggplot() + tidyterra::geom_spatraster(data = median_unc) +
+            scale_fill_viridis_c(name = "Uncertainty", direction = 1, option = "plasma", na.value = "transparent") +
+            theme_bw() + labs(title = bquote(italic(.(sp_disp)) ~ "- Median Uncertainty")) +
+            theme(plot.title = element_text(hjust = 0.5))
+          ggsave(file.path(uncertainty_dir, "01_Plots", paste0(sp, "_median_uncertainty_map.png")), p2, dpi = set_dpi, width = 10, height = 8)
+          
+          msg("Uncertainty analysis completed")
+        }
+      } else {
+        msg("Not enough models for uncertainty analysis (need at least 2)")
+      }
+      gc()
+      
+      # ========== PDP PLOTS ==========
+      msg("Generating PDP plots...")
+      
+      if (length(successful_models) >= 2) {
+        pdp_list <- list()
+        for(model_name in names(successful_models)) {
+          pdp_results <- list()
+          
+          model_obj <- successful_models[[model_name]]
+          if(inherits(model_obj, "train")) {
+            model <- model_obj
+          } else if(inherits(model_obj, "sdm_model") && !is.null(model_obj$model)) {
+            model <- model_obj$model
+          } else {
+            model <- model_obj
+          }
+          
+          for(p in var_names) {
+            tryCatch({
+              if(!is.null(model)) {
+                pdp_output <- flexsdm::data_pdp(model = model, predictors = p, resolution = pdp_res,
+                                                resid = TRUE, projection_data = env_r,
+                                                training_data = pa, clamping = FALSE)
+                if(!is.null(pdp_output) && !is.null(pdp_output$pdpdata)) {
+                  df <- pdp_output$pdpdata
+                  df$Predictor <- p
+                  df$Value <- df[[p]]
+                  df[[p]] <- NULL
+                  df$Algorithm <- model_name
+                  pdp_results[[p]] <- df
+                }
+              }
+            }, error = function(e) {})
+          }
+          pdp_results <- pdp_results[!sapply(pdp_results, is.null)]
+          if(length(pdp_results) > 0) pdp_list[[model_name]] <- dplyr::bind_rows(pdp_results)
+          gc()
+        }
+        
+        if(length(pdp_list) > 0) {
+          db_all <- dplyr::bind_rows(pdp_list)
+          db_wide <- db_all %>% dplyr::select(Predictor, Value, Algorithm, Suitability) %>%
+            tidyr::pivot_wider(names_from = Algorithm, values_from = Suitability)
+          algo_cols <- names(db_wide)[names(db_wide) %in% names(successful_models)]
+          
+          if(length(algo_cols) > 0) {
+            db_wide <- db_wide %>% dplyr::mutate(
+              Ensemble_Mean = rowMeans(dplyr::select(., dplyr::all_of(algo_cols)), na.rm = TRUE),
+              Ensemble_Median = apply(dplyr::select(., dplyr::all_of(algo_cols)), 1, median, na.rm = TRUE),
+              SD = apply(dplyr::select(., dplyr::all_of(algo_cols)), 1, sd, na.rm = TRUE),
+              ymin = pmax(0, Ensemble_Mean - SD), ymax = pmin(1, Ensemble_Mean + SD)
+            )
+            
+            db_long_mean <- db_wide %>% tidyr::pivot_longer(cols = dplyr::all_of(c(algo_cols, "Ensemble_Mean")),
+                                                            names_to = "Algorithm", values_to = "Suitability")
+            db_median <- db_wide %>% dplyr::select(Predictor, Value, Ensemble_Median) %>%
+              dplyr::mutate(Algorithm = "Ensemble_Median")
+            
+            n_models <- length(algo_cols)
+            color_values <- c(setNames(grDevices::rainbow(n_models), algo_cols),
+                              Ensemble_Mean = "black", Ensemble_Median = "steelblue")
+            linetype_values <- c(setNames(rep("dotted", n_models), algo_cols),
+                                 Ensemble_Mean = "solid", Ensemble_Median = "dashed")
+            
+            pdp_plot <- ggplot() +
+              geom_ribbon(data = db_wide, aes(x = Value, ymin = ymin, ymax = ymax), fill = "grey70", alpha = 0.4) +
+              geom_line(data = db_long_mean %>% dplyr::filter(Algorithm != "Ensemble_Mean"),
+                        aes(x = Value, y = Suitability, color = Algorithm, linetype = Algorithm), linewidth = 0.8, alpha = 0.7) +
+              geom_line(data = db_long_mean %>% dplyr::filter(Algorithm == "Ensemble_Mean"),
+                        aes(x = Value, y = Suitability), color = "black", linewidth = 1.2, linetype = "solid") +
+              geom_line(data = db_median, aes(x = Value, y = Ensemble_Median), color = "blue", linewidth = 1.2, linetype = "dashed") +
+              facet_wrap(~Predictor, scales = "free_x", ncol = 2) + coord_cartesian(ylim = c(0, 1)) +
+              scale_linetype_manual(values = linetype_values) + scale_color_manual(values = color_values) +
+              labs(title = bquote(italic(.(sp_disp)) ~ "- Partial Dependency Plot"),
+                   subtitle = paste("Based on", length(successful_models), "models"),
+                   x = "Environmental Gradient", y = "Suitability") +
+              theme_bw() + theme(panel.grid = element_blank(), legend.position = "right",
+                                 plot.title = element_text(hjust = 0.5, size = 14),
+                                 plot.subtitle = element_text(hjust = 0.5, size = 11))
+            
+            if(!dir.exists(pdp_plots_dir)) dir.create(pdp_plots_dir, recursive = TRUE)
+            ggsave(file.path(pdp_plots_dir, paste0(sp, "_pdp_ensemble.png")), pdp_plot, width = 28, height = 20, units = "cm", dpi = set_dpi)
+            write.csv(db_wide, file.path(pdp_plots_dir, paste0(sp, "_pdp_data.csv")), row.names = FALSE)
+          }
+        }
+      } else {
+        for (alg in names(successful_models)) {
+          model_obj <- successful_models[[alg]]
+          if(inherits(model_obj, "train")) {
+            model <- model_obj
+          } else if(inherits(model_obj, "sdm_model") && !is.null(model_obj$model)) {
+            model <- model_obj$model
+          } else {
+            model <- model_obj
+          }
+          if(!is.null(model)) {
+            tryCatch({
+              p_pdp <- flexsdm::data_pdp(model = model, predictors = var_names,
+                                         resolution = pdp_res, resid = TRUE,
+                                         projection_data = env_r, training_data = pa, clamping = FALSE)
+              if(!is.null(p_pdp) && !is.null(p_pdp$pdpdata)) {
+                p <- ggplot(p_pdp$pdpdata, aes(x = .data[[var_names[1]]], y = Suitability)) +
+                  geom_line(color = "red", linewidth = 1) + theme_bw() +
+                  labs(title = bquote(italic(.(sp_disp)) ~ "-" ~ .(toupper(alg))),
+                       x = var_names[1], y = "Suitability") + theme(plot.title = element_text(hjust = 0.5))
+                ggsave(file.path(pdp_plots_dir, paste0(sp, "_", alg, "_pdp.png")), p, width = 20, height = 15, units = "cm", dpi = set_dpi)
+              }
+            }, error = function(e) {})
+          }
+          gc()
+        }
+      }
+      
+      # ========== HYPERPARAMETER PLOTS ==========
+      msg("Hyperparameter plots...")
+      
+      if (!is.null(m_gbm) && !is.null(m_gbm$hyper_performance) && nrow(m_gbm$hyper_performance) > 0) {
+        h <- m_gbm$hyper_performance
+        for (metric in c("AUC_mean", "TSS_mean")) {
+          p <- tryCatch({
+            gg <- ggplot2::ggplot(h, ggplot2::aes_string(x = "n.trees", y = metric, col = "as.factor(n.minobsinnode)")) +
+              ggplot2::geom_line() + ggplot2::facet_wrap(~shrinkage) + ggplot2::theme_bw() +
+              ggplot2::ggtitle(bquote(italic(.(sp_disp)) ~ "(GBM)")) +
+              ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, size = 12), legend.position = "right")
+            gg
+          }, error = function(e) NULL)
+          if (!is.null(p)) {
+            ggsave(file.path(hypplot_cur, paste0(sp, "_hyp_gbm_", if(metric == "AUC_mean") "auc" else "tss", ".png")),
+                   p, dpi = set_dpi, width = 14, height = 10)
+          }
+        }
+        readr::write_tsv(h, file.path(hypplot_cur, paste0(sp, "_hyp_gbm.txt")))
+      }
+      
+      if (!is.null(m_max) && !is.null(m_max$hyper_performance) && nrow(m_max$hyper_performance) > 0) {
+        h <- m_max$hyper_performance
+        for (metric in c("AUC_mean", "TSS_mean")) {
+          p <- tryCatch({
+            gg <- ggplot2::ggplot(h, ggplot2::aes_string(x = "regmult", y = metric, col = "as.factor(classes)")) +
+              ggplot2::geom_line() + ggplot2::theme_bw() +
+              ggplot2::ggtitle(bquote(italic(.(sp_disp)) ~ "(MAX)")) +
+              ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, size = 12), legend.position = "right")
+            gg
+          }, error = function(e) NULL)
+          if (!is.null(p)) {
+            ggsave(file.path(hypplot_cur, paste0(sp, "_hyp_max_", if(metric == "AUC_mean") "auc" else "tss", ".png")),
+                   p, dpi = set_dpi, width = 12, height = 8)
+          }
+        }
+        readr::write_tsv(h, file.path(hypplot_cur, paste0(sp, "_hyp_max.txt")))
+      }
+      
+      if (!is.null(m_net) && !is.null(m_net$hyper_performance) && nrow(m_net$hyper_performance) > 0) {
+        h <- m_net$hyper_performance
+        for (metric in c("AUC_mean", "TSS_mean")) {
+          p <- tryCatch({
+            gg <- ggplot2::ggplot(h, ggplot2::aes_string(x = "decay", y = metric, col = "as.factor(size)")) +
+              ggplot2::geom_line() + ggplot2::theme_bw() +
+              ggplot2::ggtitle(bquote(italic(.(sp_disp)) ~ "(NET)")) +
+              ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, size = 12), legend.position = "right")
+            gg
+          }, error = function(e) NULL)
+          if (!is.null(p)) {
+            ggsave(file.path(hypplot_cur, paste0(sp, "_hyp_net_", if(metric == "AUC_mean") "auc" else "tss", ".png")),
+                   p, dpi = set_dpi, width = 12, height = 8)
+          }
+        }
+        readr::write_tsv(h, file.path(hypplot_cur, paste0(sp, "_hyp_net.txt")))
+      }
+      
+      if (!is.null(m_raf) && !is.null(m_raf$hyper_performance) && nrow(m_raf$hyper_performance) > 0) {
+        h <- m_raf$hyper_performance
+        for (metric in c("AUC_mean", "TSS_mean")) {
+          p <- tryCatch({
+            gg <- ggplot2::ggplot(h, ggplot2::aes_string(x = "mtry", y = metric)) +
+              ggplot2::geom_line() + ggplot2::theme_bw() +
+              ggplot2::ggtitle(bquote(italic(.(sp_disp)) ~ "(RAF)")) +
+              ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, size = 12))
+            gg
+          }, error = function(e) NULL)
+          if (!is.null(p)) {
+            ggsave(file.path(hypplot_cur, paste0(sp, "_hyp_raf_", if(metric == "AUC_mean") "auc" else "tss", ".png")),
+                   p, dpi = set_dpi, width = 10, height = 7)
+          }
+        }
+        readr::write_tsv(h, file.path(hypplot_cur, paste0(sp, "_hyp_raf.txt")))
+      }
+      
+      if (!is.null(m_svm) && !is.null(m_svm$hyper_performance) && nrow(m_svm$hyper_performance) > 0) {
+        h <- m_svm$hyper_performance
+        for (metric in c("AUC_mean", "TSS_mean")) {
+          p <- tryCatch({
+            gg <- ggplot2::ggplot(h, ggplot2::aes_string(x = "sigma", y = metric, col = "as.factor(C)")) +
+              ggplot2::geom_line() + ggplot2::theme_bw() +
+              ggplot2::ggtitle(bquote(italic(.(sp_disp)) ~ "(SVM)")) +
+              ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, size = 12), legend.position = "right")
+            gg
+          }, error = function(e) NULL)
+          if (!is.null(p)) {
+            ggsave(file.path(hypplot_cur, paste0(sp, "_hyp_svm_", if(metric == "AUC_mean") "auc" else "tss", ".png")),
+                   p, dpi = set_dpi, width = 12, height = 8)
+          }
+        }
+        readr::write_tsv(h, file.path(hypplot_cur, paste0(sp, "_hyp_svm.txt")))
+      }
+      
+      # ========== MODEL SELECTION ==========
+      model_list_good <- list()
+      if (!is.null(perf_summary)) {
+        good_models <- perf_summary$model[!is.na(perf_summary$AUC_mean) & perf_summary$AUC_mean >= auc_thr]
+        model_list_good <- model_list_nonnull[intersect(good_models, names(model_list_nonnull))]
+        msg("Good models (AUC>=", auc_thr, "):", length(model_list_good))
+      }
+      
+      # ========== BUILD ENSEMBLE ==========
+      ensemble_list <- list()
+      
+      if (length(model_list_good) >= 2) {
+        for (method in ens_method) {
+          msg("Building ensemble:", method)
+          ens_temp <- tryCatch(
+            flexsdm::fit_ensemble(
+              models = model_list_good, 
+              ens_method = method,
+              thr_model = "max_sens_spec", 
+              metric = "TSS"
+            ),
+            error = function(e) NULL
+          )
+          if (!is.null(ens_temp)) {
+            ensemble_list[[method]] <- ens_temp
+            msg("  Success for:", method)
+          } else {
+            msg("  Failed for:", method)
+          }
+        }
+        
+        if (length(ensemble_list) > 0) {
+          ens_perf_table <- tryCatch(
+            flexsdm::sdm_summarize(ensemble_list),
+            error = function(e) NULL
+          )
+          if (!is.null(ens_perf_table)) {
+            readr::write_tsv(ens_perf_table, file.path(perf_dir, paste0(sp, "_ens_performance.txt")))
+            msg("Ensembles built:", paste(names(ensemble_list), collapse=", "))
+          }
+        }
+      } else if (length(model_list_good) == 1) {
+        msg("Single model available, ensemble not created")
+      } else {
+        msg("No good models available for ensemble")
+      }
+      
+      # ========== SAVE FITTED MODELS ==========
+      save_file <- file.path(mod_out_dir, paste0(sp, "_fitted_models.RData"))
+      if(!dir.exists(mod_out_dir)) dir.create(mod_out_dir, recursive = TRUE)
+      tryCatch(save(model_list_nonnull, model_list_good, ensemble_list, perf_summary, file = save_file), error = function(e) NULL)
+      
+      # ========== MODELS FOR PREDICTION ==========
+      models_for_pred <- if (length(model_list_good) > 0) model_list_good else model_list_nonnull
+      
+      if(length(models_for_pred) == 0) {
+        pb$tick()
+        next
+      }
+      
+      # ========== CURRENT PROJECTIONS ==========
+      msg("CURRENT projections...")
+      
+      alg_current_base <- file.path(out_pipeline_dir, "06_Algorithms", "01_Current")
+      
+      for (alg in names(models_for_pred)) {
+        
+        alg_threshold <- NA
+        if(!is.null(perf_summary)) {
+          thr_row <- perf_summary %>% dplyr::filter(model == alg, threshold == "max_sens_spec")
+          if(nrow(thr_row) > 0) {
+            alg_threshold <- thr_row$thr_value[1]
+          }
+        }
+        
+        pr_alg <- tryCatch(
+          flexsdm::sdm_predict(
+            models = list(models_for_pred[[alg]]),
+            pred = env_r,
+            thr = "max_sens_spec",
+            con_thr = TRUE,
+            clamp = TRUE,
+            nchunk = n_chunk,
+            pred_type = "cloglog"
+          ),
+          error = function(e) NULL
+        )
+        
+        if (!is.null(pr_alg)) {
+          con_r <- if (is.list(pr_alg)) pr_alg[[1]] else pr_alg
+          bin_r <- if (is.list(pr_alg) && length(pr_alg) >= 2) pr_alg[[2]] else NULL
+          
+          if(is.null(bin_r) && !is.na(alg_threshold) && alg_threshold > 0 && alg_threshold < 1) {
+            bin_r <- con_r >= alg_threshold
+          }
+          
+          if(!is.null(bin_r)) {
+            con_path <- file.path(alg_current_base, alg, "01_con", paste0(sp, ".tif"))
+            bin_path <- file.path(alg_current_base, alg, "02_bin", paste0(sp, ".tif"))
+            
+            dir.create(dirname(con_path), recursive = TRUE, showWarnings = FALSE)
+            dir.create(dirname(bin_path), recursive = TRUE, showWarnings = FALSE)
+            
+            terra::writeRaster(con_r, con_path, overwrite = TRUE)
+            terra::writeRaster(bin_r, bin_path, overwrite = TRUE)
+            msg("  Saved", alg, "projections")
+          }
+        }
+        gc()
+      }
+      
+      # ========== CURRENT ENSEMBLE PREDICTIONS ==========
+      if (length(ensemble_list) > 0) {
+        msg("CURRENT ensemble predictions...")
+        
+        ens_current_base <- file.path(out_pipeline_dir, "07_Ensemble", "01_Current")
+        
+        for(method in names(ensemble_list)) {
+          
+          ens_threshold <- NA
+          if(!is.null(ensemble_list[[method]]$performance)) {
+            if(is.data.frame(ensemble_list[[method]]$performance) && nrow(ensemble_list[[method]]$performance) > 0) {
+              thr_row <- ensemble_list[[method]]$performance %>% 
+                dplyr::filter(threshold == "max_sens_spec")
+              if(nrow(thr_row) > 0) {
+                ens_threshold <- thr_row$thr_value[1]
+              }
+            }
+          }
+          
+          if(is.na(ens_threshold)) {
+            ens_threshold <- 0.5
+          }
+          
+          ens_pred <- tryCatch(
+            flexsdm::sdm_predict(
+              models = ensemble_list[[method]],
+              pred = env_r,
+              thr = "max_sens_spec",
+              con_thr = TRUE,
+              clamp = TRUE,
+              nchunk = n_chunk,
+              pred_type = "cloglog"
+            ),
+            error = function(e) {
+              msg("  Error predicting", method, ":", e$message)
+              return(NULL)
+            }
+          )
+          
+          if(!is.null(ens_pred)) {
+            con_r <- if (is.list(ens_pred)) ens_pred[[1]] else ens_pred
+            bin_r <- if (is.list(ens_pred) && length(ens_pred) >= 2) ens_pred[[2]] else NULL
+            
+            if(is.null(bin_r) && !is.na(ens_threshold) && ens_threshold > 0 && ens_threshold < 1) {
+              bin_r <- con_r >= ens_threshold
+            }
+            
+            if(!is.null(con_r) && !is.null(bin_r)) {
+              con_path <- file.path(ens_current_base, method, "01_con", paste0(sp, ".tif"))
+              bin_path <- file.path(ens_current_base, method, "02_bin", paste0(sp, ".tif"))
+              
+              dir.create(dirname(con_path), recursive = TRUE, showWarnings = FALSE)
+              dir.create(dirname(bin_path), recursive = TRUE, showWarnings = FALSE)
+              
+              terra::writeRaster(con_r, con_path, overwrite = TRUE)
+              terra::writeRaster(bin_r, bin_path, overwrite = TRUE)
+              msg("  Saved ensemble", method, "projections")
+            } else {
+              msg("  Failed to create binary for", method)
+            }
+          } else {
+            msg("  Prediction failed for", method)
+          }
+        }
+      } else {
+        msg("No valid ensemble available for current predictions")
+      }
+      
+      # ========== PALEO PROJECTIONS ==========
+      msg("PALEO projections...")
+      
+      alg_paleo_base <- file.path(out_pipeline_dir, "06_Algorithms", "02_Projection")
+      pred_paleo_dir <- file.path(pred_dir, "02_Projection")
+      
+      if(dir.exists(pred_paleo_dir)) {
+        for (p in paleo_names) {
+          paleo_file <- file.path(pred_paleo_dir, p, paste0(sp, ".tif"))
+          if (!file.exists(paleo_file)) next
+          
+          env_pal <- terra::rast(paleo_file)
+          
+          for (alg in names(models_for_pred)) {
+            alg_threshold <- NA
+            if(!is.null(perf_summary)) {
+              thr_row <- perf_summary %>% dplyr::filter(model == alg, threshold == "max_sens_spec")
+              if(nrow(thr_row) > 0) {
+                alg_threshold <- thr_row$thr_value[1]
+              }
+            }
+            
+            pr_alg <- tryCatch(
+              flexsdm::sdm_predict(
+                models = list(models_for_pred[[alg]]),
+                pred = env_pal,
+                thr = "max_sens_spec",
+                con_thr = TRUE,
+                clamp = TRUE,
+                nchunk = n_chunk,
+                pred_type = "cloglog"
+              ),
+              error = function(e) NULL
+            )
+            
+            if (!is.null(pr_alg)) {
+              con_r <- if (is.list(pr_alg)) pr_alg[[1]] else pr_alg
+              bin_r <- if (is.list(pr_alg) && length(pr_alg) >= 2) pr_alg[[2]] else NULL
+              
+              if(is.null(bin_r) && !is.na(alg_threshold) && alg_threshold > 0 && alg_threshold < 1) {
+                bin_r <- con_r >= alg_threshold
+              }
+              
+              if(!is.null(bin_r)) {
+                con_path <- file.path(alg_paleo_base, p, alg, "01_con", paste0(sp, ".tif"))
+                bin_path <- file.path(alg_paleo_base, p, alg, "02_bin", paste0(sp, ".tif"))
+                
+                dir.create(dirname(con_path), recursive = TRUE, showWarnings = FALSE)
+                dir.create(dirname(bin_path), recursive = TRUE, showWarnings = FALSE)
+                
+                terra::writeRaster(con_r, con_path, overwrite = TRUE)
+                terra::writeRaster(bin_r, bin_path, overwrite = TRUE)
+              }
+            }
+            gc()
+          }
+          
+          if (length(ensemble_list) > 0) {
+            ens_paleo_base <- file.path(out_pipeline_dir, "07_Ensemble", "02_Projection", p)
+            
+            for(method in names(ensemble_list)) {
+              
+              ens_threshold <- NA
+              if(!is.null(ensemble_list[[method]]$performance)) {
+                if(is.data.frame(ensemble_list[[method]]$performance) && nrow(ensemble_list[[method]]$performance) > 0) {
+                  thr_row <- ensemble_list[[method]]$performance %>% 
+                    dplyr::filter(threshold == "max_sens_spec")
+                  if(nrow(thr_row) > 0) {
+                    ens_threshold <- thr_row$thr_value[1]
+                  }
+                }
+              }
+              
+              if(is.na(ens_threshold)) ens_threshold <- 0.5
+              
+              ens_pred <- tryCatch(
+                flexsdm::sdm_predict(
+                  models = ensemble_list[[method]],
+                  pred = env_pal,
+                  thr = "max_sens_spec",
+                  con_thr = TRUE,
+                  clamp = TRUE,
+                  nchunk = n_chunk,
+                  pred_type = "cloglog"
+                ),
+                error = function(e) NULL
+              )
+              
+              if(!is.null(ens_pred)) {
+                con_r <- if (is.list(ens_pred)) ens_pred[[1]] else ens_pred
+                bin_r <- if (is.list(ens_pred) && length(ens_pred) >= 2) ens_pred[[2]] else NULL
+                
+                if(is.null(bin_r) && !is.na(ens_threshold) && ens_threshold > 0 && ens_threshold < 1) {
+                  bin_r <- con_r >= ens_threshold
+                }
+                
+                if(!is.null(con_r) && !is.null(bin_r)) {
+                  con_path <- file.path(ens_paleo_base, method, "01_con", paste0(sp, ".tif"))
+                  bin_path <- file.path(ens_paleo_base, method, "02_bin", paste0(sp, ".tif"))
+                  
+                  dir.create(dirname(con_path), recursive = TRUE, showWarnings = FALSE)
+                  dir.create(dirname(bin_path), recursive = TRUE, showWarnings = FALSE)
+                  
+                  terra::writeRaster(con_r, con_path, overwrite = TRUE)
+                  terra::writeRaster(bin_r, bin_path, overwrite = TRUE)
+                }
+              }
+            }
+          }
+        }
+      } else {
+        msg("No paleo projections directory found")
+      }
+      
+      # ========== FUTURE PROJECTIONS ==========
+      msg("FUTURE projections...")
+      
+      alg_future_base <- file.path(out_pipeline_dir, "06_Algorithms", "03_Projection")
+      pred_future_dir <- file.path(pred_dir, "03_Projection")
+      
+      if(dir.exists(pred_future_dir)) {
+        for (f in future_names) {
+          future_file <- file.path(pred_future_dir, f, paste0(sp, ".tif"))
+          if (!file.exists(future_file)) next
+          
+          env_fut <- terra::rast(future_file)
+          
+          for (alg in names(models_for_pred)) {
+            alg_threshold <- NA
+            if(!is.null(perf_summary)) {
+              thr_row <- perf_summary %>% dplyr::filter(model == alg, threshold == "max_sens_spec")
+              if(nrow(thr_row) > 0) {
+                alg_threshold <- thr_row$thr_value[1]
+              }
+            }
+            
+            pr_alg <- tryCatch(
+              flexsdm::sdm_predict(
+                models = list(models_for_pred[[alg]]),
+                pred = env_fut,
+                thr = "max_sens_spec",
+                con_thr = TRUE,
+                clamp = TRUE,
+                nchunk = n_chunk,
+                pred_type = "cloglog"
+              ),
+              error = function(e) NULL
+            )
+            
+            if (!is.null(pr_alg)) {
+              con_r <- if (is.list(pr_alg)) pr_alg[[1]] else pr_alg
+              bin_r <- if (is.list(pr_alg) && length(pr_alg) >= 2) pr_alg[[2]] else NULL
+              
+              if(is.null(bin_r) && !is.na(alg_threshold) && alg_threshold > 0 && alg_threshold < 1) {
+                bin_r <- con_r >= alg_threshold
+              }
+              
+              if(!is.null(bin_r)) {
+                con_path <- file.path(alg_future_base, f, alg, "01_con", paste0(sp, ".tif"))
+                bin_path <- file.path(alg_future_base, f, alg, "02_bin", paste0(sp, ".tif"))
+                
+                dir.create(dirname(con_path), recursive = TRUE, showWarnings = FALSE)
+                dir.create(dirname(bin_path), recursive = TRUE, showWarnings = FALSE)
+                
+                terra::writeRaster(con_r, con_path, overwrite = TRUE)
+                terra::writeRaster(bin_r, bin_path, overwrite = TRUE)
+              }
+            }
+            gc()
+          }
+          
+          if (length(ensemble_list) > 0) {
+            ens_future_base <- file.path(out_pipeline_dir, "07_Ensemble", "03_Projection", f)
+            
+            for(method in names(ensemble_list)) {
+              
+              ens_threshold <- NA
+              if(!is.null(ensemble_list[[method]]$performance)) {
+                if(is.data.frame(ensemble_list[[method]]$performance) && nrow(ensemble_list[[method]]$performance) > 0) {
+                  thr_row <- ensemble_list[[method]]$performance %>% 
+                    dplyr::filter(threshold == "max_sens_spec")
+                  if(nrow(thr_row) > 0) {
+                    ens_threshold <- thr_row$thr_value[1]
+                  }
+                }
+              }
+              
+              if(is.na(ens_threshold)) ens_threshold <- 0.5
+              
+              ens_pred <- tryCatch(
+                flexsdm::sdm_predict(
+                  models = ensemble_list[[method]],
+                  pred = env_fut,
+                  thr = "max_sens_spec",
+                  con_thr = TRUE,
+                  clamp = TRUE,
+                  nchunk = n_chunk,
+                  pred_type = "cloglog"
+                ),
+                error = function(e) NULL
+              )
+              
+              if(!is.null(ens_pred)) {
+                con_r <- if (is.list(ens_pred)) ens_pred[[1]] else ens_pred
+                bin_r <- if (is.list(ens_pred) && length(ens_pred) >= 2) ens_pred[[2]] else NULL
+                
+                if(is.null(bin_r) && !is.na(ens_threshold) && ens_threshold > 0 && ens_threshold < 1) {
+                  bin_r <- con_r >= ens_threshold
+                }
+                
+                if(!is.null(con_r) && !is.null(bin_r)) {
+                  con_path <- file.path(ens_future_base, method, "01_con", paste0(sp, ".tif"))
+                  bin_path <- file.path(ens_future_base, method, "02_bin", paste0(sp, ".tif"))
+                  
+                  dir.create(dirname(con_path), recursive = TRUE, showWarnings = FALSE)
+                  dir.create(dirname(bin_path), recursive = TRUE, showWarnings = FALSE)
+                  
+                  terra::writeRaster(con_r, con_path, overwrite = TRUE)
+                  terra::writeRaster(bin_r, bin_path, overwrite = TRUE)
+                  msg("  Saved future ensemble", method, "for", f)
+                }
+              }
+            }
+          }
+        }
+      } else {
+        msg("No future projections directory found")
+      }
+      
+      msg("")
+      
+      # Clean up for this species (MINIMAL - no directory deletion)
+      rm(list = grep("^m_", ls(), value = TRUE), envir = environment())
+      if (exists("env_r")) rm(env_r, envir = environment())
+      if (exists("env_pal")) rm(env_pal, envir = environment())
+      if (exists("env_fut")) rm(env_fut, envir = environment())
+      
+      # Only clean terra temp files, NOT the directory
+      terra::tmpFiles(remove = TRUE, old = TRUE)
+      gc(verbose = FALSE)
+      
+    }, error = function(e) {
+      msg("ERROR:", e$message)
+      msg("")
+    })
+    
+    pb$tick()
+  }
+  
+  msg("SDM workflow completed for", pipeline)
+  msg("")
+}
+
+# ============================================================================
+# SECTION 8: CLEANUP (MINIMAL - NO DIRECTORY DELETION)
+# ============================================================================
+
+prt_sec("FINAL SUMMARY REPORT")
+
+msg("SDM workflows completed successfully!")
+msg("")
+msg("Output directories:")
+msg("  01_Without_MD:", file.path(base_sdm, "01_Without_MD"))
+if(sdm_mode == "both" || sdm_mode == "with") {
+  msg("  02_With_MD:", file.path(base_sdm, "02_With_MD"))
+}
+msg("")
+
+# Minimal final cleanup - DO NOT delete custom_temp
+# The temp directory can be reused or manually deleted later
+tryCatch({
+  terra::tmpFiles(remove = TRUE, old = TRUE)
+}, error = function(e) {})
+
+# Close parallel backend ONCE at the end
+tryCatch({
+  if(require(doParallel, quietly = TRUE)) {
+    stopImplicitCluster()
+    registerDoSEQ()  # Switch back to sequential
+  }
+}, error = function(e) {})
+
+# Final garbage collection
+gc(verbose = FALSE)
+
+msg("\n", strrep("=", 80))
+msg("SDM WORKFLOW COMPLETED SUCCESSFULLY")
+msg(strrep("=", 80))
